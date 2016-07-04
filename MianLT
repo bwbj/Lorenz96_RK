@@ -1,0 +1,159 @@
+%% this code is simulation of Lorenz96 using Runge-Kutta method
+% this code together with Lorenz96RK_LT.m file are dedicated for 
+% <Data Assimilation> Class as a final project test withou any 
+% conflict of interest; Supervisor: GuoCan Wu, GCESS of BNU
+% Author: Teng Li@20160702; Contact: litengbnu@foxmial.com
+%% construct initial value and parameter set
+clear;
+global nx dt;
+nx = 40; % 40 variable distributed in a cycle
+dt = 0.05; % time steps to integral in R_K function
+
+Ftrue = 8; % to generate true state
+Ffore = 6; % to forecast in assimilation
+size = 30; % ensemble size in EnKF filter
+initX = zeros(40, 1);
+initX(1:40) = Ftrue; % initial condition
+initX(20) = 1.001*Ftrue;
+
+pertb = 0.2; % forecast pertubation's std
+obseError = 1; % observation error's std
+finalTime = 2000; % the last time step 2000
+obseFreq = 1/4;  % observe once for every 4 forecast
+Rspatial = zeros(40); % spatial correlation matrix to localization
+for ii = 1:40
+    for jj = 1:40
+        tt = min(abs(ii-jj),40 - abs(ii-jj));
+        Rspatial(ii,jj) = 0.5^tt;
+    end
+end
+clear ii jj tt
+% imagesc(Rspatial)
+
+trueState = zeros(nx, finalTime);
+
+foreEnse = zeros(nx, finalTime, size);
+foreEnseInf = foreEnse;
+foreMean = trueState;
+foreMeanInf = trueState;
+
+obse = zeros(nx, finalTime*obseFreq);
+
+assiEnse = zeros(nx, finalTime*obseFreq, size);
+assiEnseInf = assiEnse;
+P = zeros(nx, nx, finalTime*obseFreq);
+PInf = P;
+diff  = obse;
+diffij = assiEnse;
+diffInf = obse;
+diffijInf = assiEnse;
+
+L = zeros(2, finalTime*obseFreq); % Max Likelihood with lamda = 1 or min
+lamdaMin = zeros(500,1);
+%% constuct true state and observation with error;
+% 1st method to generate obseError, plus RspatialRoot*obseError*randn(40,1)
+% separately every obseTime, Matrix Rooting using SVD of lamda rooting.
+% RspatialRoot = sqrtm(Rspatial);
+
+% 2nd method to generate obseError, plus multi-normal random matrix
+% holistically, MengLiu told me he used normrnd function?
+obseErrorAll = mvnrnd(zeros(1,40),Rspatial,500)';
+for time = 1:finalTime
+    if time == 1
+        trueState(:,time) = LorenzRK_LT(Ftrue, initX);
+    else 
+        trueState(:,time) = LorenzRK_LT(Ftrue,trueState(:,time-1));
+        if mod(time, 4) == 0
+            obse(:,time*obseFreq) = trueState(:, time) + obseErrorAll(:, time*obseFreq);
+        end
+    end    
+end
+
+%% EnKF iteration begin! 1 st part is about forecast without assimilation
+for time = 1:finalTime
+    if time == 1         
+%         forePertb = pertb*randn(nx, size);
+%         foreTemp = LorenzRK_LT(Ffore, initX)';
+        foreEnse(:,time,:) = bsxfun(@plus,pertb*randn(nx, size), LorenzRK_LT(Ffore, initX));
+        foreMean(:,time) = mean(squeeze(foreEnse(:,time,:)),2);
+        foreEnseInf(:,time, :) = foreEnse(:,time,:);
+        foreMeanInf(:,time) = foreMean(:,time);     
+        
+    else         
+        foreEnse(:,time,:) = bsxfun(@plus,pertb * randn(nx, size), ...
+            LorenzRK_LT(Ffore, foreMean(:, time-1)));
+        foreMean(:,time) = mean(squeeze(foreEnse(:,time,:)),2);
+        
+        foreEnseInf(:, time, :) = bsxfun(@plus,pertb * randn(nx, size), ...
+            LorenzRK_LT(Ffore, foreMeanInf(:, time-1)));
+        foreMeanInf(:, time) = mean(squeeze(foreEnseInf(:,time,:)),2);
+        % these disp()s are for debugging, which can be deleted them if you want.
+        %         disp(time);
+        %         disp(norm(trueState(:,time) - foreMean(:,time)));
+        %         disp(norm(trueState(:,time) - foreMeanInf(:,time)));
+        %         disp(norm(squeeze(foreEnseInf(:,time, :) - foreEnse(:,time,:))));
+%% Here comes the true essense of EnKF：2nd part is inplementation of diagram.
+        if mod(time, 4) == 0                     
+            diff(:,time*obseFreq) = obse(:,time*obseFreq) - foreMean(:,time);
+            diffij(:,time*obseFreq,:) = bsxfun(@minus,obse(:,time*obseFreq),...
+                squeeze(foreEnse(:, time,:))) + obseError*randn(40, 30);
+            
+            diffInf(:,time*obseFreq) = obse(:,time*obseFreq) - foreMeanInf(:,time);
+            diffijInf(:,time*obseFreq,:) = bsxfun(@minus,obse(:,time*obseFreq),...
+                squeeze(foreEnseInf(:, time,:))) + obseError*randn(40, 30);
+                
+            foreError = bsxfun(@minus, squeeze(foreEnse(:,time,:)),foreMean(:, time));
+            P(:,:,time*obseFreq) = foreError * foreError'/ (size -1);
+            
+            foreErrorInf = bsxfun(@minus, squeeze(foreEnseInf(:,time,:)),foreMeanInf(:, time));
+            PInf(:,:,time*obseFreq) = foreErrorInf *foreErrorInf' / (size-1);
+            %%        without inflation which means lamda = 1
+            L(1, time*obseFreq) = log(det(P(:,:,time*obseFreq) + Rspatial))...
+                + diff(:,time*obseFreq)'* inv(P(:,:,time*obseFreq) + Rspatial)*diff(:,time*obseFreq);
+            temp1 = P(:,:,time*obseFreq); 
+            assiEnse(:,time*obseFreq,:) = squeeze(foreEnse(:,time,:)) + ...
+                temp1 * inv(temp1 +Rspatial) * squeeze(diffij(:,time*obseFreq,:));
+            foreMean(:,time) = mean(squeeze(assiEnse(:,time*obseFreq,:)),2);
+                        
+            %       with inflation requite optimize lamda
+            FunOptm = @(lamda)(log(det(lamda * PInf(:,:,time*obseFreq) + Rspatial)) + ...
+                diffInf(:,time*obseFreq)' * inv(lamda * PInf(:,:,time*obseFreq) + Rspatial) * diffInf(:,time*obseFreq));
+            [lamdaMin(time*obseFreq), L(2, time*obseFreq)] = fminbnd(FunOptm, 0,100);
+            %         Question: how can i define the search inteval of optimazed
+            %         function to find the exact lamda without priori knowledge?
+            temp2 = lamdaMin(time*obseFreq) * PInf(:,:,time*obseFreq);
+            assiEnseInf(:, time*obseFreq,:) = squeeze(foreEnseInf(:,time,:)) + ...
+                temp2 * inv(temp2 + Rspatial) * squeeze(diffijInf(:, time*obseFreq,:));
+            foreMeanInf(:,time) = mean(squeeze(assiEnseInf(:,time*obseFreq,:)),2);
+%             temp2 - temp1
+        end  
+    end
+end
+%% validation RMSE and plot
+rmse1 = sqrt(sum((trueState - foreMean).^2)/nx);
+rmse2 = sqrt(sum((trueState - foreMeanInf).^2)/nx);
+plot(rmse1)
+hold on
+plot(rmse2)
+script1 = ['Mean RMSE of EnKF with inflation is ',num2str(mean(rmse2))];
+script2 = ['comparing with that of ',num2str(mean(rmse1)),' without inflation'];
+text(300,8,script1);
+text(300,7.5,script2)
+xlabel('TimeSteps from 1 to 2000')
+ylabel('RMSE')
+title('EnKalman Filter RMSE with & without inflation')
+legend('No-Inf','With Inf')
+figure(2)
+plot(L(1,:))
+% semilogy(L(1,:));
+hold on
+plot(L(2,:));
+% semilogy(L(2,:));
+script1 = ['Mean Likelihood of EnKF with inflation is ',num2str(mean(L(2,:)))];
+script2 = ['comparing with that of ', num2str(mean(L(1,:))), 'without inflation'];
+text(70,2700,script1);
+text(70,2500,script2)
+xlabel('TimeSteps from 1 to 500')
+ylabel('Max Likelihood')
+title('-2*ln(Likelihood) with & wiouth inflation')
+legend('No-Inf','With Inf')
